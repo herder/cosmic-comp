@@ -10,6 +10,7 @@ use crate::{
     config::ScreenFilter,
     shell::Shell,
     state::SurfaceDmabufFeedback,
+    utils::icc::{self, GamutCorrection},
     utils::prelude::*,
     wayland::handlers::{
         compositor::recursive_frame_time_estimation,
@@ -51,7 +52,8 @@ use smithay::{
                 },
             },
             gles::{
-                GlesRenderbuffer, GlesRenderer, GlesTexture, Uniform, element::TextureShaderElement,
+                GlesRenderbuffer, GlesRenderer, GlesTexture, Uniform, UniformValue,
+                element::TextureShaderElement,
             },
             glow::GlowRenderer,
             multigpu::{ApiDevice, Error as MultiError, GpuManager},
@@ -146,6 +148,7 @@ pub struct SurfaceThreadState {
     output: Output,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
+    gamut_correction: Option<GamutCorrection>,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -542,6 +545,7 @@ fn surface_thread(
         frame_callback_seq: 0,
         thread_sender,
 
+        gamut_correction: icc::load_for_output(&name),
         output,
         mirroring: None,
         screen_filter,
@@ -1098,11 +1102,13 @@ impl SurfaceThreadState {
         let source_output = self
             .mirroring
             .as_ref()
-            .or((!self.screen_filter.is_noop()).then_some(&self.output))
+            .or((!self.screen_filter.is_noop() || self.gamut_correction.is_some())
+                .then_some(&self.output))
             .filter(|output| {
                 PostprocessOutputConfig::for_output_untransformed(output)
                     != PostprocessOutputConfig::for_output(&self.output)
                     || !self.screen_filter.is_noop()
+                    || self.gamut_correction.is_some()
             });
 
         let mut pre_postprocess_data = PrePostprocessData::default();
@@ -1282,6 +1288,7 @@ impl SurfaceThreadState {
                 &pre_postprocess_data,
                 postprocess_state,
                 &self.screen_filter,
+                self.gamut_correction.as_ref(),
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
@@ -1856,12 +1863,44 @@ fn send_screencopy_result<'a>(
     Ok(())
 }
 
+fn postprocess_uniforms(
+    screen_filter: &ScreenFilter,
+    gamut_correction: Option<&GamutCorrection>,
+) -> Vec<Uniform<'static>> {
+    let mut uniforms = vec![
+        Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
+        Uniform::new(
+            "color_mode",
+            screen_filter
+                .color_filter
+                .map(|val| val as u8 as f32)
+                .unwrap_or(0.),
+        ),
+        Uniform::new(
+            "gamut_enabled",
+            if gamut_correction.is_some() { 1. } else { 0. },
+        ),
+    ];
+    if let Some(correction) = gamut_correction {
+        uniforms.push(Uniform::new(
+            "gamut_matrix",
+            UniformValue::Matrix3x3 {
+                matrices: vec![correction.gl_matrix()],
+                transpose: false,
+            },
+        ));
+        uniforms.push(Uniform::new("gamut_gamma", correction.gamma));
+    }
+    uniforms
+}
+
 fn postprocess_elements<'a>(
     renderer: &mut GlMultiRenderer<'a>,
     output: &Output,
     pre_postprocess_data: &PrePostprocessData,
     postprocess_state: &PostprocessState,
     screen_filter: &ScreenFilter,
+    gamut_correction: Option<&GamutCorrection>,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
     let postprocess_texture_shader = Borrow::<GlesRenderer>::borrow(renderer.as_ref())
         .egl_context()
@@ -1893,16 +1932,7 @@ fn postprocess_elements<'a>(
         elements[0] = Some(TextureShaderElement::new(
             texture_elem,
             postprocess_texture_shader.0.clone(),
-            vec![
-                Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-                Uniform::new(
-                    "color_mode",
-                    screen_filter
-                        .color_filter
-                        .map(|val| val as u8 as f32)
-                        .unwrap_or(0.),
-                ),
-            ],
+            postprocess_uniforms(screen_filter, gamut_correction),
         ));
     }
 
@@ -1927,16 +1957,7 @@ fn postprocess_elements<'a>(
     elements[1] = Some(TextureShaderElement::new(
         texture_elem,
         postprocess_texture_shader.0.clone(),
-        vec![
-            Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-            Uniform::new(
-                "color_mode",
-                screen_filter
-                    .color_filter
-                    .map(|val| val as u8 as f32)
-                    .unwrap_or(0.),
-            ),
-        ],
+        postprocess_uniforms(screen_filter, gamut_correction),
     ));
 
     constrain_render_elements(

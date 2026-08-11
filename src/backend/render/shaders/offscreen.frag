@@ -23,6 +23,19 @@ uniform float tint;
 uniform float invert;
 uniform float color_mode;
 
+// Output gamut correction: linear-light sRGB -> panel-native primaries,
+// derived from the output's ICC profile (see utils/icc.rs).
+uniform float gamut_enabled;
+uniform mat3 gamut_matrix;
+uniform float gamut_gamma;
+
+vec3 srgb_eotf(vec3 c) {
+    // IEC 61966-2-1 piecewise decode
+    vec3 lo = c / 12.92;
+    vec3 hi = pow(max((c + 0.055) / 1.055, vec3(0.0)), vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+
 void main() {
     vec4 color = texture2D(tex, v_coords);
 
@@ -81,6 +94,14 @@ void main() {
         correction.b =  (diff.r * 0.7) + (diff.b * 1.0);
 
         color.rgb += correction;
+    }
+
+    // Gamut-compress last: map sRGB-intent colors into the panel's native
+    // primaries in linear light, then re-encode with the panel's TRC.
+    if (gamut_enabled == 1.0) {
+        vec3 linear = srgb_eotf(clamp(color.rgb, vec3(0.0), vec3(1.0)));
+        linear = clamp(gamut_matrix * linear, vec3(0.0), vec3(1.0));
+        color.rgb = pow(linear, vec3(1.0 / gamut_gamma));
     }
 
     // re-multiply
