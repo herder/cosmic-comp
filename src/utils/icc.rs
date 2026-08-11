@@ -80,6 +80,8 @@ pub enum IccError {
     BadTagType([u8; 4]),
     #[error("colorant matrix is singular")]
     Singular,
+    #[error("TRC gamma {0} is outside the plausible display range")]
+    ImplausibleGamma(f64),
 }
 
 /// TRC exponent assumed when a profile carries no (usable) TRC tag.
@@ -274,6 +276,9 @@ pub fn gamut_correction(profile: &IccProfile) -> Result<GamutCorrection, IccErro
         [profile.red.y, profile.green.y, profile.blue.y],
         [profile.red.z, profile.green.z, profile.blue.z],
     ];
+    if !(0.5..=5.0).contains(&profile.gamma) {
+        return Err(IccError::ImplausibleGamma(profile.gamma));
+    }
     let inv_panel = invert3(panel).ok_or(IccError::Singular)?;
     let m = mul3(inv_panel, SRGB_PCS);
     Ok(GamutCorrection {
@@ -533,6 +538,18 @@ mod tests {
         assert!(matches!(
             gamut_correction(&profile),
             Err(IccError::Singular)
+        ));
+    }
+
+    #[test]
+    fn implausible_gamma_is_rejected() {
+        // A malformed TRC declaring gamma ~0 must not reach the shader,
+        // where 1.0/gamma would divide by zero.
+        let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Gamma(0.0));
+        let profile = parse_icc(&bytes).expect("parses");
+        assert!(matches!(
+            gamut_correction(&profile),
+            Err(IccError::ImplausibleGamma(_))
         ));
     }
 
