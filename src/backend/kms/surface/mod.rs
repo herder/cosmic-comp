@@ -1891,8 +1891,12 @@ fn postprocess_uniforms(
                 transpose: false,
             },
         ));
-        let [red, green, blue] = correction.gamma;
-        uniforms.push(Uniform::new("gamut_gamma", (red, green, blue)));
+        uniforms.extend(
+            correction
+                .trc_uniforms()
+                .into_iter()
+                .map(|(name, value)| Uniform::new(name, value)),
+        );
     }
     uniforms
 }
