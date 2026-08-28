@@ -40,11 +40,133 @@ pub struct IccProfile {
     pub green: Xyz,
     /// Blue colorant, D50 PCS-relative.
     pub blue: Xyz,
-    /// Effective per-channel TRC exponents, in R, G, B order. Factory panel
-    /// profiles carry three distinct curves — their differences *are* the
-    /// grey-balance calibration, so collapsing them to one would reintroduce
-    /// the cast the profile exists to remove.
-    pub gamma: [f64; 3],
+    /// Per-channel tone response, in R, G, B order. Factory panel profiles
+    /// carry three distinct curves — their differences *are* the grey-balance
+    /// calibration, so collapsing them to one would reintroduce the cast the
+    /// profile exists to remove.
+    pub trc: [Trc; 3],
+}
+
+/// One channel's tone response, normalized to the ICC paraCurveType type-4
+/// form. Every simpler curve type, and a plain gamma, is a special case:
+///
+/// ```text
+/// Y = (a·X + b)^g + e   for X >= d
+/// Y = c·X + f           for X <  d
+/// ```
+///
+/// Collapsing this to one exponent (what a midpoint fit does) costs up to
+/// **9 of 255 output codes in the deepest black** on a real sRGB-style
+/// type-3 curve, where the correct code is only ~7 — so the error exceeds
+/// the signal exactly where an OLED is least forgiving. Hence the full form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trc {
+    pub g: f64,
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+}
+
+impl Trc {
+    /// A pure power law, `Y = X^g`.
+    fn power(g: f64) -> Self {
+        Trc {
+            g,
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Normalize an ICC paraCurveType to the type-4 form. Semantics per
+    /// ICC.1:2010 §10.16; types 0–3 differ in which parameters they omit,
+    /// and notably type 2's fourth parameter is an *offset*, where type 3's
+    /// is the slope of the linear segment.
+    fn from_para(function_type: u16, p: &[f64]) -> Option<Self> {
+        let linear_join = |a: f64, b: f64| (a != 0.0).then(|| -b / a);
+        Some(match function_type {
+            0 => Trc::power(p[0]),
+            1 => Trc {
+                g: p[0],
+                a: p[1],
+                b: p[2],
+                c: 0.0,
+                d: linear_join(p[1], p[2])?,
+                e: 0.0,
+                f: 0.0,
+            },
+            2 => Trc {
+                g: p[0],
+                a: p[1],
+                b: p[2],
+                c: 0.0,
+                d: linear_join(p[1], p[2])?,
+                e: p[3],
+                f: p[3],
+            },
+            3 => Trc {
+                g: p[0],
+                a: p[1],
+                b: p[2],
+                c: p[3],
+                d: p[4],
+                e: 0.0,
+                f: 0.0,
+            },
+            4 => Trc {
+                g: p[0],
+                a: p[1],
+                b: p[2],
+                c: p[3],
+                d: p[4],
+                e: p[5],
+                f: p[6],
+            },
+            _ => return None,
+        })
+    }
+
+    /// Decode: panel drive value → linear light.
+    pub fn decode(&self, x: f64) -> f64 {
+        if x >= self.d {
+            let base = self.a * x + self.b;
+            if base <= 0.0 {
+                self.e
+            } else {
+                base.powf(self.g) + self.e
+            }
+        } else {
+            self.c * x + self.f
+        }
+    }
+
+    /// Linear-light value at the piecewise join — the threshold the shader
+    /// branches on, since it works in linear light rather than in `X`.
+    fn y_join(&self) -> f64 {
+        let base = self.a * self.d + self.b;
+        if base <= 0.0 {
+            self.e
+        } else {
+            base.powf(self.g) + self.e
+        }
+    }
+
+    /// Exponent of the pure power law through the curve's midpoint. Only for
+    /// the plausibility check and for logging — never for the correction.
+    fn effective_gamma(&self) -> f64 {
+        let y = self.decode(0.5);
+        if y > 0.0 {
+            y.ln() / 0.5f64.ln()
+        } else {
+            f64::NAN
+        }
+    }
 }
 
 /// Ready-to-use correction for the postprocess shader.
@@ -52,8 +174,59 @@ pub struct IccProfile {
 pub struct GamutCorrection {
     /// Linear-light sRGB → panel-native primaries, row-major.
     pub matrix: [[f32; 3]; 3],
-    /// Per-channel panel TRC exponents for re-encoding after the matrix.
-    pub gamma: [f32; 3],
+    /// Per-channel inverse-TRC coefficients for re-encoding after the matrix.
+    pub trc: [TrcEncode; 3],
+}
+
+/// One channel's inverse TRC, as the shader consumes it: linear light `Y` to
+/// drive value `X`, inverting [`Trc`].
+///
+/// ```text
+/// X = ((Y - e)^(1/g) - b) / a   for Y >= y_join
+/// X = (Y - f) / c               for Y <  y_join
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrcEncode {
+    pub g: f32,
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub e: f32,
+    pub f: f32,
+    pub y_join: f32,
+}
+
+impl TrcEncode {
+    fn from_trc(t: &Trc) -> Self {
+        let y_join = t.y_join();
+        // Both shader branches are always evaluated, so the unused one must
+        // still be finite. Where the linear segment is unreachable (y_join 0,
+        // which is every pure-gamma curve) c is free, so make it a safe 1.
+        let (c, y_join) = if t.c == 0.0 || y_join <= 0.0 {
+            (1.0, 0.0)
+        } else {
+            (t.c, y_join)
+        };
+        TrcEncode {
+            g: t.g as f32,
+            a: t.a as f32,
+            b: t.b as f32,
+            c: c as f32,
+            e: t.e as f32,
+            f: t.f as f32,
+            y_join: y_join as f32,
+        }
+    }
+
+    /// Encode: linear light → drive value. Mirrors the shader exactly, so a
+    /// test can hold the two to the same numbers.
+    pub fn encode(&self, y: f32) -> f32 {
+        if y >= self.y_join {
+            ((y - self.e).max(0.0).powf(1.0 / self.g) - self.b) / self.a
+        } else {
+            (y - self.f) / self.c
+        }
+    }
 }
 
 impl GamutCorrection {
@@ -65,6 +238,42 @@ impl GamutCorrection {
             m[0][0], m[1][0], m[2][0], //
             m[0][1], m[1][1], m[2][1], //
             m[0][2], m[1][2], m[2][2],
+        ]
+    }
+
+    /// How far outside the panel's gamut the sRGB primaries fall, if at all.
+    ///
+    /// A negative matrix coefficient means an sRGB primary is not reproducible
+    /// on this panel, so the shader's clamp will hard-clip it and shift that
+    /// hue. Wide-gamut panels contain sRGB and return `None`; panels that do
+    /// not fully cover it do not, and the caller should say so out loud.
+    pub fn srgb_coverage_deficit(&self) -> Option<f32> {
+        // Published colorant sets are rounded, so a coefficient that is truly
+        // zero lands a hair either side of it. Below a quarter of an 8-bit
+        // code there is nothing to clip and nothing to report.
+        const NOISE_FLOOR: f32 = 1e-3;
+        self.matrix
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|v| *v < -NOISE_FLOOR)
+            .fold(None, |worst: Option<f32>, v| {
+                Some(worst.map_or(-v, |w| w.max(-v)))
+            })
+    }
+
+    /// Shader uniform name/value pairs for the inverse TRC, one `vec3` per
+    /// coefficient across the R, G, B channels. Names match offscreen.frag.
+    pub fn trc_uniforms(&self) -> [(&'static str, (f32, f32, f32)); 7] {
+        let [r, g, b] = &self.trc;
+        [
+            ("trc_g", (r.g, g.g, b.g)),
+            ("trc_a", (r.a, g.a, b.a)),
+            ("trc_b", (r.b, g.b, b.b)),
+            ("trc_c", (r.c, g.c, b.c)),
+            ("trc_e", (r.e, g.e, b.e)),
+            ("trc_f", (r.f, g.f, b.f)),
+            ("trc_y_join", (r.y_join, g.y_join, b.y_join)),
         ]
     }
 }
@@ -85,6 +294,12 @@ pub enum IccError {
     Singular,
     #[error("TRC gamma {0} is outside the plausible display range")]
     ImplausibleGamma(f64),
+    #[error("not an RGB/XYZ display profile (class {class:?}, space {space:?}, PCS {pcs:?})")]
+    WrongProfileKind {
+        class: [u8; 4],
+        space: [u8; 4],
+        pcs: [u8; 4],
+    },
 }
 
 /// TRC exponent assumed when a profile carries no (usable) TRC tag.
@@ -106,6 +321,18 @@ pub fn parse_icc(bytes: &[u8]) -> Result<IccProfile, IccError> {
     }
     if &bytes[36..40] != b"acsp" {
         return Err(IccError::BadMagic);
+    }
+    // Header fields per ICC.1:2010 §7.2: device class at 12, data colour
+    // space at 16, PCS at 20. A printer profile or a Lab-PCS profile can
+    // carry tags of the right shape and would otherwise parse into nonsense
+    // that only shows up as wrong colour on screen.
+    let (class, space, pcs) = (&bytes[12..16], &bytes[16..20], &bytes[20..24]);
+    if class != b"mntr" || space != b"RGB " || pcs != b"XYZ " {
+        return Err(IccError::WrongProfileKind {
+            class: class.try_into().unwrap(),
+            space: space.try_into().unwrap(),
+            pcs: pcs.try_into().unwrap(),
+        });
     }
 
     let tag_count = be_u32(bytes, 128) as usize;
@@ -146,14 +373,14 @@ pub fn parse_icc(bytes: &[u8]) -> Result<IccProfile, IccError> {
 
     // Red is the reference: a profile carrying only rTRC means "same for all",
     // which is a better fallback for the other two than DEFAULT_GAMMA.
-    let red_gamma = match find(b"rTRC") {
-        None => DEFAULT_GAMMA,
-        Some(data) => trc_gamma(data, b"rTRC")?,
+    let red = match find(b"rTRC") {
+        None => Trc::power(DEFAULT_GAMMA),
+        Some(data) => trc_curve(data, b"rTRC")?,
     };
-    let channel = |sig: &[u8; 4]| -> Result<f64, IccError> {
+    let channel = |sig: &[u8; 4]| -> Result<Trc, IccError> {
         match find(sig) {
-            None => Ok(red_gamma),
-            Some(data) => trc_gamma(data, sig),
+            None => Ok(red),
+            Some(data) => trc_curve(data, sig),
         }
     };
 
@@ -161,31 +388,41 @@ pub fn parse_icc(bytes: &[u8]) -> Result<IccProfile, IccError> {
         red: xyz(b"rXYZ")?,
         green: xyz(b"gXYZ")?,
         blue: xyz(b"bXYZ")?,
-        gamma: [red_gamma, channel(b"gTRC")?, channel(b"bTRC")?],
+        trc: [red, channel(b"gTRC")?, channel(b"bTRC")?],
     })
 }
 
-/// Effective exponent of one `curv`/`para` TRC tag.
-fn trc_gamma(data: &[u8], sig: &[u8; 4]) -> Result<f64, IccError> {
+/// One `curv`/`para` TRC tag, normalized to [`Trc`].
+fn trc_curve(data: &[u8], sig: &[u8; 4]) -> Result<Trc, IccError> {
     if data.len() >= 12 && &data[0..4] == b"curv" {
         let count = be_u32(data, 8) as usize;
         return match count {
-            0 => Ok(1.0), // identity curve per spec
-            1 if data.len() >= 14 => {
-                Ok(u16::from_be_bytes(data[12..14].try_into().unwrap()) as f64 / 256.0)
+            0 => Ok(Trc::power(1.0)), // identity curve per spec
+            1 if data.len() >= 14 => Ok(Trc::power(
+                u16::from_be_bytes(data[12..14].try_into().unwrap()) as f64 / 256.0,
+            )),
+            // A sampled table has no closed form; a fitted power law is the
+            // best we can do without uploading the whole curve to the GPU.
+            n if data.len() >= 12 + n * 2 => {
+                Ok(Trc::power(estimate_table_gamma(&data[12..12 + n * 2])))
             }
-            n if data.len() >= 12 + n * 2 => Ok(estimate_table_gamma(&data[12..12 + n * 2])),
             _ => Err(IccError::Truncated),
         };
     }
     if data.len() >= 12 && &data[0..4] == b"para" {
-        return parametric_gamma(data).ok_or(IccError::Truncated);
+        return parametric_trc(data).ok_or(IccError::Truncated);
     }
     Err(IccError::BadTagType(*sig))
 }
 
-/// Fit an exponent to a sampled TRC at its midpoint (exact for pure-gamma
-/// tables, adequate for the near-gamma curves factory profiles carry).
+/// Fit an exponent to a sampled TRC at its midpoint.
+///
+/// Exact for a pure-gamma table, which is the case a fit is actually for.
+/// Least squares on log(y) = g·log(x) looks like the better answer and is
+/// not: it minimizes *relative* error, so a curve with a linear toe (an
+/// sRGB-shaped table) drags the fit down badly — 16.5 output codes of peak
+/// error against the midpoint fit's 1.3, and still worse when restricted to
+/// the upper range. Measured, not assumed; see the accompanying test.
 fn estimate_table_gamma(samples: &[u8]) -> f64 {
     let n = samples.len() / 2;
     let at = |i: usize| u16::from_be_bytes(samples[i * 2..i * 2 + 2].try_into().unwrap());
@@ -198,12 +435,8 @@ fn estimate_table_gamma(samples: &[u8]) -> f64 {
     y.ln() / x.ln()
 }
 
-/// Effective exponent of an ICC paraCurveType: evaluate the parametric
-/// function at x = 0.5 and fit a pure power law through it. Exact for
-/// function type 0; for piecewise types (e.g. sRGB's type 3, g = 2.4) this
-/// yields the perceptually effective gamma (~2.2), which is what the shader
-/// re-encode wants.
-fn parametric_gamma(data: &[u8]) -> Option<f64> {
+/// Parse an ICC paraCurveType into the normalized [`Trc`] form.
+fn parametric_trc(data: &[u8]) -> Option<Trc> {
     let function_type = u16::from_be_bytes(data[8..10].try_into().unwrap());
     let param_count = match function_type {
         0 => 1,
@@ -216,38 +449,8 @@ fn parametric_gamma(data: &[u8]) -> Option<f64> {
     if data.len() < 12 + param_count * 4 {
         return None;
     }
-    let p = |i: usize| s15f16(data, 12 + i * 4);
-    let x: f64 = 0.5;
-    let y = match function_type {
-        0 => x.powf(p(0)),
-        1 | 2 => {
-            let (g, a, b) = (p(0), p(1), p(2));
-            let c = if function_type == 2 { p(3) } else { 0.0 };
-            if a * x + b >= 0.0 {
-                (a * x + b).powf(g) + c
-            } else {
-                c
-            }
-        }
-        3 | 4 => {
-            let (g, a, b, c, d) = (p(0), p(1), p(2), p(3), p(4));
-            let (e, f) = if function_type == 4 {
-                (p(5), p(6))
-            } else {
-                (0.0, 0.0)
-            };
-            if x >= d {
-                (a * x + b).powf(g) + e
-            } else {
-                c * x + f
-            }
-        }
-        _ => unreachable!(),
-    };
-    if y <= 0.0 {
-        return Some(DEFAULT_GAMMA);
-    }
-    Some(y.ln() / x.ln())
+    let p: Vec<f64> = (0..param_count).map(|i| s15f16(data, 12 + i * 4)).collect();
+    Trc::from_para(function_type, &p)
 }
 
 fn invert3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
@@ -292,14 +495,21 @@ pub fn gamut_correction(profile: &IccProfile) -> Result<GamutCorrection, IccErro
         [profile.red.y, profile.green.y, profile.blue.y],
         [profile.red.z, profile.green.z, profile.blue.z],
     ];
-    if let Some(bad) = profile.gamma.iter().find(|g| !(0.5..=5.0).contains(*g)) {
-        return Err(IccError::ImplausibleGamma(*bad));
+    for trc in &profile.trc {
+        let effective = trc.effective_gamma();
+        if !(0.5..=5.0).contains(&effective) || trc.a == 0.0 {
+            return Err(IccError::ImplausibleGamma(effective));
+        }
     }
     let inv_panel = invert3(panel).ok_or(IccError::Singular)?;
     let m = mul3(inv_panel, SRGB_PCS);
     Ok(GamutCorrection {
         matrix: m.map(|row| row.map(|v| v as f32)),
-        gamma: profile.gamma.map(|g| g as f32),
+        trc: [
+            TrcEncode::from_trc(&profile.trc[0]),
+            TrcEncode::from_trc(&profile.trc[1]),
+            TrcEncode::from_trc(&profile.trc[2]),
+        ],
     })
 }
 
@@ -350,6 +560,14 @@ pub fn load_for_output(output_name: &str) -> Option<GamutCorrection> {
         .and_then(|path| match std::fs::read(&path) {
             Ok(bytes) => match parse_icc(&bytes).and_then(|p| gamut_correction(&p)) {
                 Ok(correction) => {
+                    if let Some(deficit) = correction.srgb_coverage_deficit() {
+                        tracing::warn!(
+                            ?path,
+                            deficit,
+                            "Panel gamut does not contain sRGB; out-of-gamut colors \
+                             will be hard-clipped and those hues will shift"
+                        );
+                    }
                     tracing::info!(?path, ?correction, "Loaded ICC gamut correction");
                     Some(correction)
                 }
@@ -427,6 +645,9 @@ mod tests {
         let tag_table_len = 4 + tags.len() * 12;
         let mut offset = 128 + tag_table_len;
         let mut header = vec![0u8; 128];
+        header[12..16].copy_from_slice(b"mntr");
+        header[16..20].copy_from_slice(b"RGB ");
+        header[20..24].copy_from_slice(b"XYZ ");
         header[36..40].copy_from_slice(b"acsp");
         let mut table = (tags.len() as u32).to_be_bytes().to_vec();
         let mut body = Vec::new();
@@ -495,6 +716,9 @@ mod tests {
     fn rejects_profile_without_colorants() {
         // Header + zero tags: the shape of a cLUT-only profile for our purposes.
         let mut bytes = vec![0u8; 132];
+        bytes[12..16].copy_from_slice(b"mntr");
+        bytes[16..20].copy_from_slice(b"RGB ");
+        bytes[20..24].copy_from_slice(b"XYZ ");
         bytes[36..40].copy_from_slice(b"acsp");
         bytes[0..4].copy_from_slice(&132u32.to_be_bytes());
         // tag count = 0 at 128..132 already zeroed
@@ -525,7 +749,7 @@ mod tests {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Gamma(2.2));
         let profile = parse_icc(&bytes).expect("parses");
         // u8.8 quantization: 2.2 * 256 rounds to 563 -> 2.19921875
-        assert_close(profile.gamma[0], 2.199, 5e-3, "gamma");
+        assert_close(profile.trc[0].effective_gamma(), 2.199, 5e-3, "gamma");
     }
 
     #[test]
@@ -535,21 +759,21 @@ mod tests {
             .collect();
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Table(table));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma[0], 2.2, 0.05, "fitted gamma");
+        assert_close(profile.trc[0].effective_gamma(), 2.2, 0.05, "fitted gamma");
     }
 
     #[test]
     fn missing_trc_defaults_to_srgb_like_gamma() {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Missing);
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma[0], 2.2, 1e-9, "default gamma");
+        assert_close(profile.trc[0].effective_gamma(), 2.2, 1e-9, "default gamma");
     }
 
     #[test]
     fn zero_entry_trc_means_linear() {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Table(vec![]));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma[0], 1.0, 1e-9, "linear gamma");
+        assert_close(profile.trc[0].effective_gamma(), 1.0, 1e-9, "linear gamma");
     }
 
     #[test]
@@ -616,7 +840,12 @@ mod tests {
         // ICC v4 paraCurveType (as Apple profiles use); first param is the exponent.
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Para(2.4));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma[0], 2.4, 1e-4, "parametric gamma");
+        assert_close(
+            profile.trc[0].effective_gamma(),
+            2.4,
+            1e-4,
+            "parametric gamma",
+        );
     }
 
     #[test]
@@ -640,8 +869,9 @@ mod tests {
             }
         }
         // sRGB's piecewise EOTF fits a pure exponent of ~2.2 at midpoint.
-        for (i, g) in correction.gamma.iter().enumerate() {
-            assert_close(*g as f64, 2.2, 0.1, &format!("sRGB.icc gamma[{i}]"));
+        for (i, t) in correction.trc.iter().enumerate() {
+            assert_close(t.g as f64, 2.4, 0.1, &format!("sRGB.icc exponent[{i}]"));
+            assert!(t.y_join > 0.0, "sRGB.icc keeps its linear toe [{i}]");
         }
     }
 
@@ -654,15 +884,15 @@ mod tests {
             [TrcTag::Gamma(2.2), TrcTag::Gamma(2.3), TrcTag::Gamma(2.1)],
         );
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma[0], 2.2, 5e-3, "red gamma");
-        assert_close(profile.gamma[1], 2.3, 5e-3, "green gamma");
-        assert_close(profile.gamma[2], 2.1, 5e-3, "blue gamma");
+        assert_close(profile.trc[0].effective_gamma(), 2.2, 5e-3, "red gamma");
+        assert_close(profile.trc[1].effective_gamma(), 2.3, 5e-3, "green gamma");
+        assert_close(profile.trc[2].effective_gamma(), 2.1, 5e-3, "blue gamma");
 
         let correction = gamut_correction(&profile).expect("invertible");
         assert!(
-            correction.gamma[0] != correction.gamma[1]
-                && correction.gamma[1] != correction.gamma[2],
-            "per-channel exponents must survive into the shader uniform"
+            correction.trc[0].g != correction.trc[1].g
+                && correction.trc[1].g != correction.trc[2].g,
+            "per-channel curves must survive into the shader uniforms"
         );
     }
 
@@ -673,15 +903,10 @@ mod tests {
             [TrcTag::Gamma(1.8), TrcTag::Missing, TrcTag::Missing],
         );
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(
-            profile.gamma[1],
-            profile.gamma[0],
-            1e-9,
-            "green follows red",
-        );
-        assert_close(profile.gamma[2], profile.gamma[0], 1e-9, "blue follows red");
+        assert_eq!(profile.trc[1], profile.trc[0], "green follows red");
+        assert_eq!(profile.trc[2], profile.trc[0], "blue follows red");
         assert!(
-            (profile.gamma[1] - DEFAULT_GAMMA).abs() > 0.1,
+            (profile.trc[1].effective_gamma() - DEFAULT_GAMMA).abs() > 0.1,
             "an rTRC-only profile means 'same for all', not 'assume 2.2'"
         );
     }
@@ -730,11 +955,158 @@ mod tests {
         );
     }
 
+    /// The sRGB TRC as a paraCurveType type 3, as real profiles store it.
+    const SRGB_PARA: [f64; 5] = [2.39999, 0.94786, 0.05214, 0.07739, 0.04045];
+
+    #[test]
+    fn shader_encode_inverts_the_parsed_curve_everywhere() {
+        // The reason the piecewise form is carried through at all: the encode
+        // the shader performs must invert the profile's decode across the
+        // whole range, the deep shadows included.
+        let trc = Trc::from_para(3, &SRGB_PARA).expect("type 3 parses");
+        let encode = TrcEncode::from_trc(&trc);
+        for i in 0..=1000 {
+            let x = i as f64 / 1000.0;
+            let round_tripped = encode.encode(trc.decode(x) as f32) as f64;
+            assert!(
+                (round_tripped - x).abs() < 1e-3,
+                "x={x} decoded to {} and came back {round_tripped}",
+                trc.decode(x)
+            );
+        }
+    }
+
+    #[test]
+    fn collapsing_the_curve_to_one_exponent_would_wreck_the_shadows() {
+        // Documents the cost this complexity buys off: a single fitted
+        // exponent is worth ~9 of 255 output codes in the deepest black,
+        // where the correct code is only about 7.
+        let trc = Trc::from_para(3, &SRGB_PARA).expect("type 3 parses");
+        let exact = TrcEncode::from_trc(&trc);
+        let collapsed = TrcEncode::from_trc(&Trc::power(trc.effective_gamma()));
+
+        let (worst_codes, at) = (1..=4095)
+            .map(|i| {
+                let y = i as f32 / 4095.0;
+                ((collapsed.encode(y) - exact.encode(y)).abs() * 255.0, y)
+            })
+            .fold((0.0f32, 0.0f32), |a, b| if b.0 > a.0 { b } else { a });
+
+        assert!(
+            worst_codes > 5.0,
+            "expected the collapse to be visibly wrong, got {worst_codes:.2} codes"
+        );
+        assert!(
+            at < 0.05,
+            "and wrong in the shadows specifically, got worst at linear={at}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_profile_that_is_not_an_rgb_xyz_display_profile() {
+        // A CMYK printer profile can carry tags of the right shape; parsing it
+        // as a panel profile would silently produce nonsense colour.
+        let mut bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Gamma(2.2));
+        bytes[12..16].copy_from_slice(b"prtr");
+        assert!(matches!(
+            parse_icc(&bytes),
+            Err(IccError::WrongProfileKind { .. })
+        ));
+
+        let mut bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Gamma(2.2));
+        bytes[20..24].copy_from_slice(b"Lab ");
+        assert!(matches!(
+            parse_icc(&bytes),
+            Err(IccError::WrongProfileKind { .. })
+        ));
+    }
+
+    #[test]
+    fn a_panel_narrower_than_srgb_is_reported_not_silently_clipped() {
+        // sRGB primaries pulled 30% toward white — a panel that cannot
+        // reproduce them. The shader clamp would hard-clip and shift the hue,
+        // so the deficit has to reach the log.
+        const NARROW_PCS: [[f64; 3]; 3] = [
+            [0.4016743, 0.3659674, 0.1965783],
+            [0.2557531, 0.6018150, 0.1424318],
+            [0.0922735, 0.1504941, 0.5824423],
+        ];
+        let bytes = synthetic_profile(NARROW_PCS, TrcTag::Gamma(2.2));
+        let profile = parse_icc(&bytes).expect("parses");
+        let correction = gamut_correction(&profile).expect("invertible");
+        let deficit = correction
+            .srgb_coverage_deficit()
+            .expect("a narrow panel must report a deficit");
+        assert_close(deficit as f64, 0.14286, 1e-3, "worst deficit");
+
+        // A wide-gamut panel contains sRGB and must stay quiet.
+        let p3 = parse_icc(&synthetic_profile(P3_PCS, TrcTag::Gamma(2.2))).expect("parses");
+        assert!(
+            gamut_correction(&p3)
+                .expect("invertible")
+                .srgb_coverage_deficit()
+                .is_none(),
+            "P3 contains sRGB and must not warn"
+        );
+    }
+
+    #[test]
+    fn table_trc_fit_keeps_the_midpoint_rather_than_least_squares() {
+        // Guards against a plausible-looking "improvement". Least squares on
+        // log(y) = g·log(x) minimizes relative error, so an sRGB-shaped table
+        // drags it toward the toe and it loses badly to one midpoint sample.
+        let trc = Trc::from_para(3, &SRGB_PARA).expect("type 3 parses");
+        let n = 1024usize;
+        let samples: Vec<u16> = (0..n)
+            .map(|i| (trc.decode(i as f64 / (n - 1) as f64) * 65535.0).round() as u16)
+            .collect();
+        let value = |i: usize| samples[i] as f64 / 65535.0;
+        let peak_err = |g: f64| {
+            (1..n)
+                .map(|i| (i as f64 / (n - 1) as f64).powf(g) - value(i))
+                .fold(0.0f64, |m, e| m.max(e.abs()))
+        };
+
+        let fitted = parse_icc(&synthetic_profile(
+            SRGB_PCS_F64,
+            TrcTag::Table(samples.clone()),
+        ))
+        .expect("parses")
+        .trc[0]
+            .g;
+        let least_squares = {
+            let (mut num, mut den) = (0.0, 0.0);
+            for i in 1..n - 1 {
+                let (x, y) = ((i as f64 / (n - 1) as f64).ln(), value(i).ln());
+                num += x * y;
+                den += x * x;
+            }
+            num / den
+        };
+        assert!(
+            peak_err(fitted) < peak_err(least_squares),
+            "midpoint fit {fitted} (err {:.5}) must stay ahead of least squares \
+             {least_squares} (err {:.5})",
+            peak_err(fitted),
+            peak_err(least_squares)
+        );
+
+        // And a table that really is a power law is recovered exactly.
+        let pure: Vec<u16> = (0..n)
+            .map(|i| ((i as f64 / (n - 1) as f64).powf(2.2) * 65535.0).round() as u16)
+            .collect();
+        let g = parse_icc(&synthetic_profile(SRGB_PCS_F64, TrcTag::Table(pure)))
+            .expect("parses")
+            .trc[0]
+            .g;
+        assert_close(g, 2.2, 1e-4, "pure power table");
+    }
+
     #[test]
     fn gl_matrix_is_column_major() {
         let correction = GamutCorrection {
             matrix: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
-            gamma: [2.2, 2.2, 2.2],
+            trc: [TrcEncode::from_trc(&Trc::power(2.2)); 3],
         };
         assert_eq!(
             correction.gl_matrix(),
