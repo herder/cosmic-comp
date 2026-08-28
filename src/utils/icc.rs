@@ -40,8 +40,11 @@ pub struct IccProfile {
     pub green: Xyz,
     /// Blue colorant, D50 PCS-relative.
     pub blue: Xyz,
-    /// Effective TRC exponent (from the red channel's curve).
-    pub gamma: f64,
+    /// Effective per-channel TRC exponents, in R, G, B order. Factory panel
+    /// profiles carry three distinct curves — their differences *are* the
+    /// grey-balance calibration, so collapsing them to one would reintroduce
+    /// the cast the profile exists to remove.
+    pub gamma: [f64; 3],
 }
 
 /// Ready-to-use correction for the postprocess shader.
@@ -49,8 +52,8 @@ pub struct IccProfile {
 pub struct GamutCorrection {
     /// Linear-light sRGB → panel-native primaries, row-major.
     pub matrix: [[f32; 3]; 3],
-    /// Panel TRC exponent for re-encoding after the matrix.
-    pub gamma: f32,
+    /// Per-channel panel TRC exponents for re-encoding after the matrix.
+    pub gamma: [f32; 3],
 }
 
 impl GamutCorrection {
@@ -141,31 +144,44 @@ pub fn parse_icc(bytes: &[u8]) -> Result<IccProfile, IccError> {
         })
     };
 
-    let gamma = match find(b"rTRC") {
+    // Red is the reference: a profile carrying only rTRC means "same for all",
+    // which is a better fallback for the other two than DEFAULT_GAMMA.
+    let red_gamma = match find(b"rTRC") {
         None => DEFAULT_GAMMA,
-        Some(data) if data.len() >= 12 && &data[0..4] == b"curv" => {
-            let count = be_u32(data, 8) as usize;
-            match count {
-                0 => 1.0, // identity curve per spec
-                1 if data.len() >= 14 => {
-                    u16::from_be_bytes(data[12..14].try_into().unwrap()) as f64 / 256.0
-                }
-                n if data.len() >= 12 + n * 2 => estimate_table_gamma(&data[12..12 + n * 2]),
-                _ => return Err(IccError::Truncated),
-            }
+        Some(data) => trc_gamma(data, b"rTRC")?,
+    };
+    let channel = |sig: &[u8; 4]| -> Result<f64, IccError> {
+        match find(sig) {
+            None => Ok(red_gamma),
+            Some(data) => trc_gamma(data, sig),
         }
-        Some(data) if data.len() >= 12 && &data[0..4] == b"para" => {
-            parametric_gamma(data).ok_or(IccError::Truncated)?
-        }
-        Some(_) => return Err(IccError::BadTagType(*b"rTRC")),
     };
 
     Ok(IccProfile {
         red: xyz(b"rXYZ")?,
         green: xyz(b"gXYZ")?,
         blue: xyz(b"bXYZ")?,
-        gamma,
+        gamma: [red_gamma, channel(b"gTRC")?, channel(b"bTRC")?],
     })
+}
+
+/// Effective exponent of one `curv`/`para` TRC tag.
+fn trc_gamma(data: &[u8], sig: &[u8; 4]) -> Result<f64, IccError> {
+    if data.len() >= 12 && &data[0..4] == b"curv" {
+        let count = be_u32(data, 8) as usize;
+        return match count {
+            0 => Ok(1.0), // identity curve per spec
+            1 if data.len() >= 14 => {
+                Ok(u16::from_be_bytes(data[12..14].try_into().unwrap()) as f64 / 256.0)
+            }
+            n if data.len() >= 12 + n * 2 => Ok(estimate_table_gamma(&data[12..12 + n * 2])),
+            _ => Err(IccError::Truncated),
+        };
+    }
+    if data.len() >= 12 && &data[0..4] == b"para" {
+        return parametric_gamma(data).ok_or(IccError::Truncated);
+    }
+    Err(IccError::BadTagType(*sig))
 }
 
 /// Fit an exponent to a sampled TRC at its midpoint (exact for pure-gamma
@@ -276,29 +292,60 @@ pub fn gamut_correction(profile: &IccProfile) -> Result<GamutCorrection, IccErro
         [profile.red.y, profile.green.y, profile.blue.y],
         [profile.red.z, profile.green.z, profile.blue.z],
     ];
-    if !(0.5..=5.0).contains(&profile.gamma) {
-        return Err(IccError::ImplausibleGamma(profile.gamma));
+    if let Some(bad) = profile.gamma.iter().find(|g| !(0.5..=5.0).contains(*g)) {
+        return Err(IccError::ImplausibleGamma(*bad));
     }
     let inv_panel = invert3(panel).ok_or(IccError::Singular)?;
     let m = mul3(inv_panel, SRGB_PCS);
     Ok(GamutCorrection {
         matrix: m.map(|row| row.map(|v| v as f32)),
-        gamma: profile.gamma as f32,
+        gamma: profile.gamma.map(|g| g as f32),
     })
 }
 
-/// Load a correction for an output: `$XDG_CONFIG_HOME/icc/<output>.icm`,
-/// falling back to `$XDG_CONFIG_HOME/icc/profile.icm`. Any error is logged
-/// and treated as "no profile".
-pub fn load_for_output(output_name: &str) -> Option<GamutCorrection> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))?;
-    let dir = base.join("icc");
+/// Candidate profile paths for an output, most specific first.
+///
+/// `~/.local/share/icc` is where colord, DisplayCAL and argyll actually install
+/// profiles, so it is searched alongside our own `~/.config/icc` override dir.
+/// An output-specific profile in either dir beats a generic one in either.
+fn profile_candidates(
+    config_dir: Option<&Path>,
+    data_dir: Option<&Path>,
+    output_name: &str,
+) -> Vec<std::path::PathBuf> {
+    let dirs: Vec<_> = [config_dir, data_dir]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join("icc"))
+        .collect();
 
-    [format!("{output_name}.icm"), "profile.icm".to_string()]
-        .iter()
-        .map(|name| dir.join(name))
+    let mut specific = Vec::new();
+    let mut generic = Vec::new();
+    for dir in &dirs {
+        // Both extensions denote the same format; tools disagree on which to write.
+        for ext in ["icc", "icm"] {
+            specific.push(dir.join(format!("{output_name}.{ext}")));
+            generic.push(dir.join(format!("profile.{ext}")));
+        }
+    }
+    // An output-specific profile in any dir beats a generic one anywhere.
+    specific.extend(generic);
+    specific
+}
+
+/// Load a correction for an output. Searched paths are those of
+/// [`profile_candidates`]; any error is logged and treated as "no profile".
+pub fn load_for_output(output_name: &str) -> Option<GamutCorrection> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+
+    profile_candidates(config_dir.as_deref(), data_dir.as_deref(), output_name)
+        .into_iter()
         .find(|p| p.exists())
         .and_then(|path| match std::fs::read(&path) {
             Ok(bytes) => match parse_icc(&bytes).and_then(|p| gamut_correction(&p)) {
@@ -322,28 +369,27 @@ pub fn load_for_output(output_name: &str) -> Option<GamutCorrection> {
 mod tests {
     use super::*;
 
-    /// Build a minimal matrix/TRC ICC display profile.
-    /// `colorants` are (r, g, b) columns as XYZ triplets, D50 PCS-relative.
-    /// `trc` becomes the rTRC tag; gTRC/bTRC mirror it.
-    fn synthetic_profile(colorants: [[f64; 3]; 3], trc: TrcTag) -> Vec<u8> {
-        fn s15f16(v: f64) -> [u8; 4] {
-            (((v * 65536.0).round()) as i32).to_be_bytes()
+    fn s15f16(v: f64) -> [u8; 4] {
+        (((v * 65536.0).round()) as i32).to_be_bytes()
+    }
+
+    fn xyz_tag(col: usize, colorants: &[[f64; 3]; 3]) -> Vec<u8> {
+        let mut data = b"XYZ \0\0\0\0".to_vec();
+        for row in 0..3 {
+            data.extend_from_slice(&s15f16(colorants[row][col]));
         }
-        fn xyz_tag(col: usize, colorants: &[[f64; 3]; 3]) -> Vec<u8> {
-            let mut data = b"XYZ \0\0\0\0".to_vec();
-            for row in 0..3 {
-                data.extend_from_slice(&s15f16(colorants[row][col]));
-            }
-            data
-        }
-        let trc_data: Vec<u8> = match trc {
+        data
+    }
+
+    fn trc_bytes(trc: &TrcTag) -> Vec<u8> {
+        match trc {
             TrcTag::Gamma(g) => {
                 let mut d = b"curv\0\0\0\0".to_vec();
                 d.extend_from_slice(&1u32.to_be_bytes());
                 d.extend_from_slice(&(((g * 256.0).round()) as u16).to_be_bytes());
                 d
             }
-            TrcTag::Table(ref samples) => {
+            TrcTag::Table(samples) => {
                 let mut d = b"curv\0\0\0\0".to_vec();
                 d.extend_from_slice(&(samples.len() as u32).to_be_bytes());
                 for s in samples {
@@ -359,17 +405,23 @@ mod tests {
                 d.extend_from_slice(&(((g * 65536.0).round()) as i32).to_be_bytes());
                 d
             }
-        };
+        }
+    }
 
+    /// Build a minimal matrix/TRC ICC display profile.
+    /// `colorants` are (r, g, b) columns as XYZ triplets, D50 PCS-relative.
+    /// `trcs` become the rTRC/gTRC/bTRC tags; `Missing` omits that tag.
+    fn synthetic_profile_trcs(colorants: [[f64; 3]; 3], trcs: [TrcTag; 3]) -> Vec<u8> {
         let mut tags: Vec<([u8; 4], Vec<u8>)> = vec![
             (*b"rXYZ", xyz_tag(0, &colorants)),
             (*b"gXYZ", xyz_tag(1, &colorants)),
             (*b"bXYZ", xyz_tag(2, &colorants)),
         ];
-        if !trc_data.is_empty() {
-            tags.push((*b"rTRC", trc_data.clone()));
-            tags.push((*b"gTRC", trc_data.clone()));
-            tags.push((*b"bTRC", trc_data));
+        for (sig, trc) in [b"rTRC", b"gTRC", b"bTRC"].into_iter().zip(&trcs) {
+            let data = trc_bytes(trc);
+            if !data.is_empty() {
+                tags.push((*sig, data));
+            }
         }
 
         let tag_table_len = 4 + tags.len() * 12;
@@ -393,6 +445,12 @@ mod tests {
         out
     }
 
+    /// The common case: one curve mirrored across all three channels.
+    fn synthetic_profile(colorants: [[f64; 3]; 3], trc: TrcTag) -> Vec<u8> {
+        synthetic_profile_trcs(colorants, [trc.clone(), trc.clone(), trc])
+    }
+
+    #[derive(Clone)]
     enum TrcTag {
         Gamma(f64),
         Table(Vec<u16>),
@@ -467,7 +525,7 @@ mod tests {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Gamma(2.2));
         let profile = parse_icc(&bytes).expect("parses");
         // u8.8 quantization: 2.2 * 256 rounds to 563 -> 2.19921875
-        assert_close(profile.gamma, 2.199, 5e-3, "gamma");
+        assert_close(profile.gamma[0], 2.199, 5e-3, "gamma");
     }
 
     #[test]
@@ -477,21 +535,21 @@ mod tests {
             .collect();
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Table(table));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma, 2.2, 0.05, "fitted gamma");
+        assert_close(profile.gamma[0], 2.2, 0.05, "fitted gamma");
     }
 
     #[test]
     fn missing_trc_defaults_to_srgb_like_gamma() {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Missing);
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma, 2.2, 1e-9, "default gamma");
+        assert_close(profile.gamma[0], 2.2, 1e-9, "default gamma");
     }
 
     #[test]
     fn zero_entry_trc_means_linear() {
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Table(vec![]));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma, 1.0, 1e-9, "linear gamma");
+        assert_close(profile.gamma[0], 1.0, 1e-9, "linear gamma");
     }
 
     #[test]
@@ -558,7 +616,7 @@ mod tests {
         // ICC v4 paraCurveType (as Apple profiles use); first param is the exponent.
         let bytes = synthetic_profile(SRGB_PCS_F64, TrcTag::Para(2.4));
         let profile = parse_icc(&bytes).expect("parses");
-        assert_close(profile.gamma, 2.4, 1e-4, "parametric gamma");
+        assert_close(profile.gamma[0], 2.4, 1e-4, "parametric gamma");
     }
 
     #[test]
@@ -582,14 +640,101 @@ mod tests {
             }
         }
         // sRGB's piecewise EOTF fits a pure exponent of ~2.2 at midpoint.
-        assert_close(correction.gamma as f64, 2.2, 0.1, "sRGB.icc gamma");
+        for (i, g) in correction.gamma.iter().enumerate() {
+            assert_close(*g as f64, 2.2, 0.1, &format!("sRGB.icc gamma[{i}]"));
+        }
+    }
+
+    #[test]
+    fn per_channel_trc_curves_are_kept_distinct() {
+        // The grey-balance calibration in a factory profile *is* the difference
+        // between the three curves; collapsing them reintroduces the cast.
+        let bytes = synthetic_profile_trcs(
+            SRGB_PCS_F64,
+            [TrcTag::Gamma(2.2), TrcTag::Gamma(2.3), TrcTag::Gamma(2.1)],
+        );
+        let profile = parse_icc(&bytes).expect("parses");
+        assert_close(profile.gamma[0], 2.2, 5e-3, "red gamma");
+        assert_close(profile.gamma[1], 2.3, 5e-3, "green gamma");
+        assert_close(profile.gamma[2], 2.1, 5e-3, "blue gamma");
+
+        let correction = gamut_correction(&profile).expect("invertible");
+        assert!(
+            correction.gamma[0] != correction.gamma[1]
+                && correction.gamma[1] != correction.gamma[2],
+            "per-channel exponents must survive into the shader uniform"
+        );
+    }
+
+    #[test]
+    fn channel_without_trc_falls_back_to_red_not_the_default() {
+        let bytes = synthetic_profile_trcs(
+            SRGB_PCS_F64,
+            [TrcTag::Gamma(1.8), TrcTag::Missing, TrcTag::Missing],
+        );
+        let profile = parse_icc(&bytes).expect("parses");
+        assert_close(
+            profile.gamma[1],
+            profile.gamma[0],
+            1e-9,
+            "green follows red",
+        );
+        assert_close(profile.gamma[2], profile.gamma[0], 1e-9, "blue follows red");
+        assert!(
+            (profile.gamma[1] - DEFAULT_GAMMA).abs() > 0.1,
+            "an rTRC-only profile means 'same for all', not 'assume 2.2'"
+        );
+    }
+
+    #[test]
+    fn implausible_gamma_in_any_channel_is_rejected() {
+        // Validation must cover all three, not just the one it used to read.
+        let bytes = synthetic_profile_trcs(
+            SRGB_PCS_F64,
+            [TrcTag::Gamma(2.2), TrcTag::Gamma(2.2), TrcTag::Gamma(0.0)],
+        );
+        let profile = parse_icc(&bytes).expect("parses");
+        assert!(matches!(
+            gamut_correction(&profile),
+            Err(IccError::ImplausibleGamma(_))
+        ));
+    }
+
+    #[test]
+    fn profile_search_prefers_output_specific_and_covers_the_standard_data_dir() {
+        let config = std::path::Path::new("/cfg");
+        let data = std::path::Path::new("/data");
+        let paths = profile_candidates(Some(config), Some(data), "eDP-1");
+
+        let first_generic = paths
+            .iter()
+            .position(|p| p.ends_with("profile.icc"))
+            .expect("generic candidate present");
+        let last_specific = paths
+            .iter()
+            .rposition(|p| p.to_string_lossy().contains("eDP-1"))
+            .expect("output-specific candidate present");
+        assert!(
+            last_specific < first_generic,
+            "an output-specific profile must outrank a generic one: {paths:?}"
+        );
+
+        // colord, DisplayCAL and argyll install here; the old code never looked.
+        assert!(
+            paths.contains(&data.join("icc").join("eDP-1.icc")),
+            "the standard data dir must be searched: {paths:?}"
+        );
+        assert!(
+            paths.contains(&config.join("icc").join("eDP-1.icm")),
+            "the config override dir must still be searched: {paths:?}"
+        );
     }
 
     #[test]
     fn gl_matrix_is_column_major() {
         let correction = GamutCorrection {
             matrix: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
-            gamma: 2.2,
+            gamma: [2.2, 2.2, 2.2],
         };
         assert_eq!(
             correction.gl_matrix(),
