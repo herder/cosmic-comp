@@ -27,7 +27,21 @@ uniform float color_mode;
 // derived from the output's ICC profile (see utils/icc.rs).
 uniform float gamut_enabled;
 uniform mat3 gamut_matrix;
-uniform vec3 gamut_gamma;
+uniform vec3 trc_g;
+uniform vec3 trc_a;
+uniform vec3 trc_b;
+uniform vec3 trc_c;
+uniform vec3 trc_e;
+uniform vec3 trc_f;
+uniform vec3 trc_y_join;
+
+// Inverse of the panel TRC (see utils/icc.rs). Both branches are evaluated,
+// so trc_a and trc_c are guaranteed non-zero CPU-side.
+vec3 panel_oetf(vec3 y) {
+    vec3 hi = (pow(max(y - trc_e, vec3(0.0)), vec3(1.0) / trc_g) - trc_b) / trc_a;
+    vec3 lo = (y - trc_f) / trc_c;
+    return mix(lo, hi, step(trc_y_join, y));
+}
 
 vec3 srgb_eotf(vec3 c) {
     // IEC 61966-2-1 piecewise decode
@@ -101,7 +115,7 @@ void main() {
     if (gamut_enabled == 1.0) {
         vec3 linear = srgb_eotf(clamp(color.rgb, vec3(0.0), vec3(1.0)));
         linear = clamp(gamut_matrix * linear, vec3(0.0), vec3(1.0));
-        color.rgb = pow(linear, vec3(1.0) / gamut_gamma);
+        color.rgb = clamp(panel_oetf(linear), vec3(0.0), vec3(1.0));
     }
 
     // re-multiply
