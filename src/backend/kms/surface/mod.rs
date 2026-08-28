@@ -1102,8 +1102,10 @@ impl SurfaceThreadState {
         let source_output = self
             .mirroring
             .as_ref()
-            .or((!self.screen_filter.is_noop() || self.gamut_correction.is_some())
-                .then_some(&self.output))
+            .or(
+                (!self.screen_filter.is_noop() || self.gamut_correction.is_some())
+                    .then_some(&self.output),
+            )
             .filter(|output| {
                 PostprocessOutputConfig::for_output_untransformed(output)
                     != PostprocessOutputConfig::for_output(&self.output)
@@ -1889,7 +1891,8 @@ fn postprocess_uniforms(
                 transpose: false,
             },
         ));
-        uniforms.push(Uniform::new("gamut_gamma", correction.gamma));
+        let [red, green, blue] = correction.gamma;
+        uniforms.push(Uniform::new("gamut_gamma", (red, green, blue)));
     }
     uniforms
 }
