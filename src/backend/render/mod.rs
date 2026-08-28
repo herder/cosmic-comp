@@ -423,7 +423,7 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("color_mode", UniformType::_1f),
             UniformName::new("gamut_enabled", UniformType::_1f),
             UniformName::new("gamut_matrix", UniformType::Matrix3x3),
-            UniformName::new("gamut_gamma", UniformType::_1f),
+            UniformName::new("gamut_gamma", UniformType::_3f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(

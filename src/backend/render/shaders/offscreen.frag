@@ -27,7 +27,7 @@ uniform float color_mode;
 // derived from the output's ICC profile (see utils/icc.rs).
 uniform float gamut_enabled;
 uniform mat3 gamut_matrix;
-uniform float gamut_gamma;
+uniform vec3 gamut_gamma;
 
 vec3 srgb_eotf(vec3 c) {
     // IEC 61966-2-1 piecewise decode
@@ -101,7 +101,7 @@ void main() {
     if (gamut_enabled == 1.0) {
         vec3 linear = srgb_eotf(clamp(color.rgb, vec3(0.0), vec3(1.0)));
         linear = clamp(gamut_matrix * linear, vec3(0.0), vec3(1.0));
-        color.rgb = pow(linear, vec3(1.0 / gamut_gamma));
+        color.rgb = pow(linear, vec3(1.0) / gamut_gamma);
     }
 
     // re-multiply
