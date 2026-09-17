@@ -674,6 +674,12 @@ impl SurfaceThreadState {
         self.active.store(false, Ordering::SeqCst);
         let _ = self.compositor.take();
 
+        // The offscreen textures and damage trackers belong to the GL context
+        // that does not survive a session pause. Dropping them here forces the
+        // next render to recreate them; keeping them leaves the postprocess
+        // pass compositing a texture from a dead context.
+        self.postprocess_textures.clear();
+
         match std::mem::replace(&mut self.state, QueueState::Idle) {
             QueueState::Idle => {}
             QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank(token) => {
