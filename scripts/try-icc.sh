@@ -65,7 +65,9 @@ case ":$PATH:" in
 esac
 
 outputs=$(for c in /sys/class/drm/card*-*; do
-    [[ $(cat "$c/status" 2>/dev/null) == connected ]] && basename "$c" | cut -d- -f2-
+    if [[ $(cat "$c/status" 2>/dev/null) == connected ]]; then
+        basename "$c" | cut -d- -f2-
+    fi
 done | paste -sd' ')
 
 cat <<EOF
@@ -76,8 +78,9 @@ Next:
   1. Put your panel's ICC profile at one of
        ~/.config/icc/<output>.icc   (one output; .icm also works)
        ~/.config/icc/profile.icc    (all outputs)
-     ~/.local/share/icc/ is searched too, so colord/DisplayCAL installs work as-is.
+     ~/.local/share/icc/ is searched too, under the same names.
      Connected outputs right now: ${outputs:-none found}
+     Details (where to get a profile, which kinds work): "Using it" in README.md.
   2. Log out and back in. The login screen always uses the distro compositor;
      only your session runs this one.
   3. Colours should shift visibly. If they don't, look for a rejected profile:
