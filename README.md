@@ -1,6 +1,11 @@
 # cosmic-comp
 Compositor for the COSMIC desktop environment
 
+> **This fork** adds ICC-profile gamut correction for wide-gamut panels, ahead of
+> upstream colour management. To try it on your own account (Debian/Ubuntu/Pop!_OS):
+> `scripts/try-icc.sh`, which builds, installs to `~/.local/bin`, and tells you where to
+> put your profile. `scripts/try-icc.sh uninstall` undoes it.
+
 ## Development
 
 This project uses [just](https://github.com/casey/just) as a command runner.
